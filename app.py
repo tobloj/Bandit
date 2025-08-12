@@ -139,12 +139,22 @@ if st.session_state.round <= NUM_ROUNDS:
         st.write(f"**Arm {arm} Avg Reward:** {avg:.2f}")
 
 else:
-    # Final flush to ensure all remaining rows are written
     flush_buffer()
-
     st.success("Experiment complete!")
-    df = pd.DataFrame(st.session_state.arm_rewards)
-    st.write("Final Rewards per Arm:")
+
+    # Long format: one row per click
+    rows = []
+    for arm, vals in st.session_state.arm_rewards.items():
+        for i, r in enumerate(vals, start=1):
+            rows.append({"arm": arm, "click_index_for_that_arm": i, "reward": r})
+    df = pd.DataFrame(rows).sort_values(["arm", "click_index_for_that_arm"])
+    st.write("All Clicks (long format):")
     st.dataframe(df, use_container_width=True)
+
+    # Summary
+    summary = df.groupby("arm")["reward"].agg(["count","mean","std"]).reset_index()
+    st.write("Summary:")
+    st.dataframe(summary, use_container_width=True)
+
     st.write(f"**Total Reward:** {st.session_state.total_reward:.2f}")
     st.write(f"**Total Switches:** {st.session_state.switch_count}")
