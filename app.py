@@ -20,7 +20,7 @@ try:
     gc = gspread.authorize(creds)
 
     # Open the spreadsheet by ID (stored in secrets)
-    sh = gc.open_by_key(st.secrets["SHEET_ID"])
+    sh = gc.open_by_key(st.secrets["17WqxzbP-KuFpXE9a3kqt_yGCrm2SJ8mk1f75HpqO_Lw"])
 
     # Use (or create) a worksheet called "logs"
     try:
