@@ -15,7 +15,7 @@ REWARD_MIN = 80
 REWARD_MAX = 120
 SHEET_ID = "17WqxzbP-KuFpXE9a3kqt_yGCrm2SJ8mk1f75HpqO_Lw"  # <-- your sheet
 LOG_SHEET_TITLE = "logs"
-BUFFER_FLUSH_EVERY = 15            # batch size
+BUFFER_FLUSH_EVERY = 20            # batch size
 MAX_RETRIES = 5                   # API retry attempts
 BASE_SLEEP = 1.25                 # base backoff seconds
 
