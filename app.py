@@ -2,39 +2,49 @@ import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 import time
+import gspread.exceptions as gexc
 
 st.title("Google Sheets Connection Test")
 
-# Required Google API scopes
+# --- Put YOUR Sheet ID here (between the quotes) ---
+SHEET_ID = "17WqxzbP-KuFpXE9a3kqt_yGCrm2SJ8mk1f75HpqO_Lw"
+# ---------------------------------------------------
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
 ]
 
 try:
-    # Authenticate using the JSON from Streamlit secrets
+    # Auth from secrets (service account JSON ONLY)
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
-        scopes=SCOPES
+        scopes=SCOPES,
     )
     gc = gspread.authorize(creds)
 
-    # Open the spreadsheet by ID (stored in secrets)
-    sh = gc.open_by_key(st.secrets["17WqxzbP-KuFpXE9a3kqt_yGCrm2SJ8mk1f75HpqO_Lw"])
+    # Open spreadsheet by literal ID (NOT via st.secrets)
+    sh = gc.open_by_key(SHEET_ID)
 
-    # Use (or create) a worksheet called "logs"
+    # Use or create "logs" tab
     try:
         ws = sh.worksheet("logs")
-    except gspread.exceptions.WorksheetNotFound:
+    except gexc.WorksheetNotFound:
         ws = sh.add_worksheet(title="logs", rows=1, cols=10)
         ws.append_row(["timestamp", "note"])
 
-    # Button to write a test row
     if st.button("Write test row"):
         now = int(time.time())
         ws.append_row([now, "Hello from Streamlit"], value_input_option="RAW")
-        st.success(f"✅ Row written at timestamp {now}")
+        st.success(f"✅ Row written at {now}")
 
+except gexc.APIError as e:
+    st.error("Google API Error")
+    st.exception(e)
+except KeyError as e:
+    st.error("Missing key in st.secrets (likely gcp_service_account).")
+    st.write("Top-level secret keys:", list(st.secrets.keys()))
+    st.exception(e)
 except Exception as e:
-    st.error("Something went wrong")
+    st.error("Unexpected error")
     st.exception(e)
