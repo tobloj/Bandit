@@ -1,8 +1,7 @@
 import streamlit as st
 import random
 import time
-import math
-import pandas as pd
+from typing import List
 import gspread
 import gspread.exceptions as gexc
 from google.oauth2.service_account import Credentials
@@ -13,11 +12,14 @@ from google.oauth2.service_account import Credentials
 NUM_ROUNDS = 50
 REWARD_MIN = 80
 REWARD_MAX = 120
-SHEET_ID = "17WqxzbP-KuFpXE9a3kqt_yGCrm2SJ8mk1f75HpqO_Lw"  # <-- your sheet
-LOG_SHEET_TITLE = "logs"
-BUFFER_FLUSH_EVERY = 20            # batch size
-MAX_RETRIES = 5                   # API retry attempts
-BASE_SLEEP = 1.25                 # base backoff seconds
+
+# Hard-code your working Sheet ID here
+SHEET_ID = "17WqxzbP-KuFpXE9a3kqt_yGCrm2SJ8mk1f75HpqO_Lw"
+RESPONSES_SHEET_TITLE = "responses"  # tab where 1-row-per-respondent is stored
+
+# Retry/backoff for the single final write
+MAX_RETRIES = 5
+BASE_SLEEP = 1.0  # seconds
 
 # =========================
 # GOOGLE AUTH (once)
@@ -30,14 +32,24 @@ creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"],
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SHEET_ID)
 
-# Ensure log worksheet exists and has header
-try:
-    ws = sh.worksheet(LOG_SHEET_TITLE)
-except gexc.WorksheetNotFound:
-    ws = sh.add_worksheet(title=LOG_SHEET_TITLE, rows=1, cols=20)
-    ws.append_row(["timestamp", "participant_id", "round", "arm", "reward", "switch_count"], value_input_option="RAW")
-
-LOG_RANGE = f"{LOG_SHEET_TITLE}!A:Z"  # append target
+# Ensure responses worksheet exists (create once if missing, add header if empty)
+def ensure_responses_sheet():
+    try:
+        ws = sh.worksheet(RESPONSES_SHEET_TITLE)
+    except gexc.WorksheetNotFound:
+        ws = sh.add_worksheet(title=RESPONSES_SHEET_TITLE, rows=1, cols=20)
+    # Add header if the sheet is empty
+    try:
+        if ws.row_count == 0 or ws.get_all_values() == []:
+            ws.append_row(
+                ["timestamp", "participant_id", "total_reward",
+                 "switches_total", "switches_first10", "switches_last10"],
+                value_input_option="RAW"
+            )
+    except Exception:
+        # If get_all_values throttles or header already there, it's safe to ignore
+        pass
+    return ws
 
 # =========================
 # STATE INIT
@@ -48,68 +60,91 @@ if "total_reward" not in st.session_state:
     st.session_state.total_reward = 0.0
 if "last_arm_clicked" not in st.session_state:
     st.session_state.last_arm_clicked = None
-if "switch_count" not in st.session_state:
-    st.session_state.switch_count = 0
 if "arm_rewards" not in st.session_state:
     st.session_state.arm_rewards = {"A": [], "B": [], "C": []}
+if "choices" not in st.session_state:
+    st.session_state.choices: List[str] = []  # one entry per round: "A"/"B"/"C"
 if "participant_id" not in st.session_state:
     st.session_state.participant_id = f"user_{int(time.time())}"
-if "log_buffer" not in st.session_state:
-    st.session_state.log_buffer = []
+if "final_logged" not in st.session_state:
+    st.session_state.final_logged = False  # prevent duplicate writes
 
 # =========================
-# LOGGING (batched with retries)
+# HELPERS
 # =========================
-def flush_buffer():
-    """Append all buffered rows in one API call, with retries."""
-    rows = st.session_state.log_buffer
-    if not rows:
-        return
-    for attempt in range(MAX_RETRIES):
-        try:
-            # Use spreadsheet-level values_append for true batch append
-            sh.values_append(
-                LOG_RANGE,
-                params={"valueInputOption": "RAW"},
-                body={"values": rows},
-            )
-            st.session_state.log_buffer.clear()
-            return
-        except gexc.APIError as e:
-            # Exponential backoff with jitter
-            sleep_for = BASE_SLEEP * (2 ** attempt) + (0.2 * random.random())
-            time.sleep(sleep_for)
-    # If we get here, all retries failed
-    st.error("⚠️ Could not write to Google Sheet after multiple retries. Your data is still buffered locally for this session.")
-    # (Buffer remains; you can try flushing again later)
-
-def enqueue_log(arm, reward):
-    st.session_state.log_buffer.append([
-        int(time.time()),
-        st.session_state.participant_id,
-        st.session_state.round,
-        arm,
-        float(reward),
-        st.session_state.switch_count,
-    ])
-    # Flush when buffer reaches threshold
-    if len(st.session_state.log_buffer) >= BUFFER_FLUSH_EVERY:
-        flush_buffer()
-
-# =========================
-# GAME LOGIC
-# =========================
-def handle_click(arm):
+def handle_click(arm: str):
+    """Process a click on an arm and advance the round."""
     reward = random.uniform(REWARD_MIN, REWARD_MAX)
     st.session_state.arm_rewards[arm].append(reward)
     st.session_state.total_reward += reward
-
-    if st.session_state.last_arm_clicked and st.session_state.last_arm_clicked != arm:
-        st.session_state.switch_count += 1
+    st.session_state.choices.append(arm)
     st.session_state.last_arm_clicked = arm
-
-    enqueue_log(arm, reward)
     st.session_state.round += 1
+
+def count_switches(seq: List[str], start_round: int, end_round: int) -> int:
+    """
+    Count switches between consecutive rounds within [start_round, end_round] inclusive.
+    Rounds are 1-indexed. A switch is when choice_t != choice_{t-1}.
+    """
+    # Convert to 0-based indices for choices list
+    # choices[i] corresponds to round i+1
+    start_i = max(start_round, 2) - 1  # earliest transition is from round 1->2 (i=1)
+    end_i = min(end_round, len(seq)) - 1
+    if end_i <= 0 or start_i > end_i:
+        return 0
+    switches = 0
+    for i in range(start_i, end_i + 1):
+        if seq[i] != seq[i - 1]:
+            switches += 1
+    return switches
+
+def compute_final_stats():
+    choices = st.session_state.choices
+    total = count_switches(choices, 1, NUM_ROUNDS)
+    first10 = count_switches(choices, 1, min(10, NUM_ROUNDS))
+    last10 = count_switches(choices, max(1, NUM_ROUNDS - 9), NUM_ROUNDS)
+    return {
+        "total_reward": float(st.session_state.total_reward),
+        "switches_total": int(total),
+        "switches_first10": int(first10),
+        "switches_last10": int(last10),
+    }
+
+def append_final_row():
+    """Append one final row with summary stats. Retries on transient errors."""
+    if st.session_state.final_logged:
+        return  # already written
+
+    # Make sure responses sheet exists & has header
+    ensure_responses_sheet()
+
+    stats = compute_final_stats()
+    row = [
+        int(time.time()),
+        st.session_state.participant_id,
+        stats["total_reward"],
+        stats["switches_total"],
+        stats["switches_first10"],
+        stats["switches_last10"],
+    ]
+
+    # Use spreadsheet-level values_append for append semantics (atomic-ish)
+    rng = f"{RESPONSES_SHEET_TITLE}!A:Z"
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Small jitter to avoid many users appending at exactly same time
+            time.sleep(random.uniform(0, 0.4))
+            sh.values_append(
+                rng,
+                params={"valueInputOption": "RAW"},
+                body={"values": [row]},
+            )
+            st.session_state.final_logged = True
+            return
+        except gexc.APIError:
+            time.sleep(BASE_SLEEP * (2 ** attempt) + random.random() * 0.3)
+
+    st.error("⚠️ Could not write final summary to Google Sheet after multiple retries.")
 
 # =========================
 # UI
@@ -130,31 +165,27 @@ if st.session_state.round <= NUM_ROUNDS:
         if st.button("C", use_container_width=True):
             handle_click("C")
 
+    # Live stats (optional)
     st.write(f"**Total Reward:** {st.session_state.total_reward:.2f}")
-    st.write(f"**Switch Count:** {st.session_state.switch_count}")
-
+    # Show per-arm averages
     for arm in ["A", "B", "C"]:
-        rewards = st.session_state.arm_rewards[arm]
-        avg = sum(rewards) / len(rewards) if rewards else 0.0
+        vals = st.session_state.arm_rewards[arm]
+        avg = sum(vals) / len(vals) if vals else 0.0
         st.write(f"**Arm {arm} Avg Reward:** {avg:.2f}")
 
 else:
-    flush_buffer()
+    # Compute & show final stats
+    stats = compute_final_stats()
     st.success("Experiment complete!")
+    st.write(f"**Total Reward:** {stats['total_reward']:.2f}")
+    st.write(f"**Switches — Total:** {stats['switches_total']}")
+    st.write(f"**Switches — First 10 rounds:** {stats['switches_first10']}")
+    st.write(f"**Switches — Last 10 rounds:** {stats['switches_last10']}")
 
-    # Long format: one row per click
-    rows = []
-    for arm, vals in st.session_state.arm_rewards.items():
-        for i, r in enumerate(vals, start=1):
-            rows.append({"arm": arm, "click_index_for_that_arm": i, "reward": r})
-    df = pd.DataFrame(rows).sort_values(["arm", "click_index_for_that_arm"])
-    st.write("All Clicks (long format):")
-    st.dataframe(df, use_container_width=True)
+    # Append exactly one final row to the sheet
+    append_final_row()
 
-    # Summary
-    summary = df.groupby("arm")["reward"].agg(["count","mean","std"]).reset_index()
-    st.write("Summary:")
-    st.dataframe(summary, use_container_width=True)
-
-    st.write(f"**Total Reward:** {st.session_state.total_reward:.2f}")
-    st.write(f"**Total Switches:** {st.session_state.switch_count}")
+    if st.session_state.final_logged:
+        st.info("✅ Final summary saved to the spreadsheet.")
+    else:
+        st.warning("Final summary not yet saved. You can refresh and it will try again.")
